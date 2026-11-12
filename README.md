@@ -7,6 +7,9 @@ service est écrit avec FastAPI et livré avec son `Dockerfile`.
 ## Ce que fait le service
 
 `POST /predict` reçoit des transactions et renvoie un score de fraude entre 0 et 1 pour chacune.
+`POST /pubsub` reçoit une enveloppe push Pub/Sub, score une transaction sans modifier les compteurs,
+écrit un log JSON, puis répond `204`. Une transaction invalide est loguée et renvoyée avec `422`
+pour que Pub/Sub puisse la relivrer.
 
 ```bash
 curl -X POST localhost:8000/predict -H "Content-Type: application/json" -d '{

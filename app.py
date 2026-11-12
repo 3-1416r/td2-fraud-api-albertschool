@@ -5,6 +5,9 @@ Le modèle et les compteurs journaliers sont chargés une fois par worker, au d�
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -12,8 +15,8 @@ from time import perf_counter
 
 import numpy as np
 import psutil
-from fastapi import FastAPI, Request
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import FastAPI, Request, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import features as ft
 import scoring
@@ -34,6 +37,19 @@ class Transaction(BaseModel):
 
 class PredictRequest(BaseModel):
     transactions: list[Transaction]
+
+
+class PushMessage(BaseModel):
+    data: str
+    messageId: str
+    publishTime: str | None = None
+    attributes: dict[str, str] = Field(default_factory=dict)
+
+
+class PushEnvelope(BaseModel):
+    message: PushMessage
+    subscription: str
+    deliveryAttempt: int | None = None
 
 
 class ScoredTransaction(BaseModel):
@@ -115,3 +131,47 @@ def predict(req: PredictRequest, request: Request) -> PredictResponse:
 def events(req: PredictRequest, request: Request) -> PredictResponse:
     """Score puis enregistre les transactions dans les compteurs du worker (flux)."""
     return _predict(req, request, record=True)
+
+
+@app.post("/pubsub", status_code=204)
+def pubsub(envelope: PushEnvelope, request: Request) -> Response:
+    """Score un message Pub/Sub sans muter les compteurs, puis l'acquitte."""
+    try:
+        payload = json.loads(base64.b64decode(envelope.message.data, validate=True))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+        payload = {}
+
+    try:
+        transaction = Transaction.model_validate(payload)
+    except ValidationError:
+        tx_id = None
+        if isinstance(payload, dict):
+            candidate = payload.get("TX_ID", payload.get("tx_id"))
+            tx_id = candidate if isinstance(candidate, str) else None
+        print(
+            json.dumps(
+                {
+                    "severity": "ERROR",
+                    "message": "rejected",
+                    "tx_id": tx_id,
+                    "delivery_attempt": envelope.deliveryAttempt,
+                },
+                separators=(",", ":"),
+            )
+        )
+        return Response(status_code=422)
+
+    prediction = _predict(PredictRequest(transactions=[transaction]), request, record=False)
+    print(
+        json.dumps(
+            {
+                "severity": "INFO",
+                "message": "scored",
+                "tx_id": transaction.tx_id,
+                "score": prediction.scores[0].score,
+                "delivery_attempt": envelope.deliveryAttempt,
+            },
+            separators=(",", ":"),
+        )
+    )
+    return Response(status_code=204)
